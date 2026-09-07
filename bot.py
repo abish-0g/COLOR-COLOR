@@ -60,8 +60,22 @@ def save_data(data):
 def get_chat_bucket(data, chat_id):
     key = str(chat_id)
     if key not in data:
-        data[key] = {"truths": [], "dares": []}
+        data[key] = {"truths": [], "dares": [], "scores": {}}
+    data[key].setdefault("scores", {})  # backfill for buckets saved before scoring existed
     return data[key]
+
+
+def update_score(chat_id, user_id, user_name, delta):
+    """Add `delta` points for a user in a chat and persist it. Returns new total."""
+    data = load_data()
+    bucket = get_chat_bucket(data, chat_id)
+    key = str(user_id)
+    entry = bucket["scores"].get(key, {"name": user_name, "score": 0})
+    entry["name"] = user_name  # keep the display name fresh
+    entry["score"] += delta
+    bucket["scores"][key] = entry
+    save_data(data)
+    return entry["score"]
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +149,7 @@ async def colorgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     color_games[chat_id] = {"phase": "claim", "giver_id": None, "giver_name": None,
-                             "theme": None, "color": None}
+                             "theme": None, "color": None, "attempted": set()}
 
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🙋 Main color dunga!", callback_data="cg_claim")]]
@@ -216,12 +230,20 @@ async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.id == game["giver_id"]:
             await query.answer("😅 Tum khud apna color guess nahi kar sakte!", show_alert=True)
             return
+        if user.id in game["attempted"]:
+            await query.answer("⛔ Tumhari chance is round me khatam ho chuki hai!", show_alert=True)
+            return
+
+        # Chance use ho gayi, chahe sahi ho ya galat - dobara try nahi kar sakte
+        game["attempted"].add(user.id)
+
         guess_name = data.split(":", 1)[1]
         if guess_name == game["color"]:
             emoji = game["theme"][game["color"]]
-            await query.answer("🎉 Sahi jawab!", show_alert=False)
+            new_score = update_score(chat_id, user.id, user.first_name, 2)
+            await query.answer("🎉 Sahi jawab! (+2 points)", show_alert=False)
             await query.edit_message_text(
-                f"🎉 *{user.first_name}* ne sahi guess kiya!\n\n"
+                f"🎉 *{user.first_name}* ne sahi guess kiya! (+2 points, total: {new_score})\n\n"
                 f"Secret color tha: *{COLOR_NAMES_HI[game['color']]}* {emoji}\n\n"
                 f"Naya round ke liye /colorgame bhejo.",
                 parse_mode="Markdown",
@@ -229,7 +251,16 @@ async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game["phase"] = "done"
             color_games.pop(chat_id, None)
         else:
-            await query.answer("❌ Galat! Dobara try karo.", show_alert=False)
+            new_score = update_score(chat_id, user.id, user.first_name, -1)
+            await query.answer("❌ Galat! Is round me tumhari chance khatam.", show_alert=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ *{user.first_name}* ne galat guess kiya! (-1 point, total: {new_score})\n"
+                    f"Ab inki chance is round me khatam hai — baaki log try kar sakte hain."
+                ),
+                parse_mode="Markdown",
+            )
         return
 
 
@@ -320,6 +351,18 @@ async def tdcount_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    bucket = get_chat_bucket(data, update.effective_chat.id)
+    scores = bucket.get("scores", {})
+    if not scores:
+        await update.message.reply_text("Abhi tak Color-Color me koi score nahi bana hai.")
+        return
+    ranked = sorted(scores.values(), key=lambda e: e["score"], reverse=True)
+    lines = [f"{i+1}. {e['name']} — {e['score']} pts" for i, e in enumerate(ranked)]
+    await update.message.reply_text("🏆 *Color-Color Scoreboard*\n\n" + "\n".join(lines), parse_mode="Markdown")
+
+
 # ---------------------------------------------------------------------------
 # General commands
 # ---------------------------------------------------------------------------
@@ -329,7 +372,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Namaste! Main 2 games khila sakta hoon:\n\n"
         "🎨 *Color-Color*\n"
         "/colorgame - naya round shuru karo\n"
-        "/endcolorgame - round rok do\n\n"
+        "/endcolorgame - round rok do\n"
+        "/score - is chat ka scoreboard dekho\n\n"
         "🎲 *Truth & Dare* (khud ke sawaal/dare add karo)\n"
         "/addtruth <sawaal>\n"
         "/adddare <kaam>\n"
@@ -368,6 +412,7 @@ def main():
 
     app.add_handler(CommandHandler("colorgame", colorgame_cmd))
     app.add_handler(CommandHandler("endcolorgame", endcolorgame_cmd))
+    app.add_handler(CommandHandler("score", score_cmd))
     app.add_handler(CallbackQueryHandler(color_callback, pattern="^cg_"))
 
     app.add_handler(CommandHandler("addtruth", addtruth_cmd))
