@@ -1,7 +1,8 @@
 """
 Telegram bot with 2 games:
-1. Color-Color  -> ek player secret color chunta hai, baaki players emoji/sticker se guess karte hain.
-2. Truth & Dare -> users khud apne truths/dares add karte hain, phir bot random assign karta hai.
+1. Color-Color -> one player picks a secret color, everyone else guesses it via emoji buttons.
+2. Truth & Dare -> users submit their own truths/dares, then challenge each other. The person
+   being challenged picks Truth or Dare, and answers by replying directly to the bot's message.
 
 Works in both group chats and private chats.
 
@@ -15,12 +16,17 @@ import os
 import json
 import random
 import logging
+from html import escape
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.helpers import mention_html
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(
@@ -29,13 +35,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # DATA_DIR can be overridden (e.g. point it at a Railway Volume mount path like
-# "/data") so truths/dares survive redeploys. Defaults to the app folder.
+# "/data") so truths/dares/scores survive redeploys. Defaults to the app folder.
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
 # ---------------------------------------------------------------------------
-# Persistent storage for Truth & Dare (survives bot restarts)
+# Persistent storage (truths, dares, scores) - survives bot restarts
 # ---------------------------------------------------------------------------
 
 def load_data():
@@ -44,7 +50,7 @@ def load_data():
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
-            logger.warning("data.json corrupt/unreadable, starting fresh.")
+            logger.warning("data.json is corrupt/unreadable, starting fresh.")
             return {}
     return {}
 
@@ -66,7 +72,7 @@ def get_chat_bucket(data, chat_id):
 
 
 def update_score(chat_id, user_id, user_name, delta):
-    """Add `delta` points for a user in a chat and persist it. Returns new total."""
+    """Add `delta` points for a user in a chat and persist it. Returns the new total."""
     data = load_data()
     bucket = get_chat_bucket(data, chat_id)
     key = str(user_id)
@@ -82,7 +88,7 @@ def update_score(chat_id, user_id, user_name, delta):
 # Color-Color game
 # ---------------------------------------------------------------------------
 
-# Different "themes" so the emoji set changes round to round (the "ya kuch bhi" part)
+# Different "themes" so the emoji set changes round to round.
 COLOR_THEMES = [
     {  # circles
         "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢",
@@ -98,9 +104,9 @@ COLOR_THEMES = [
     },
 ]
 
-COLOR_NAMES_HI = {
-    "red": "Laal", "orange": "Orange", "yellow": "Peela", "green": "Hara",
-    "blue": "Neela", "purple": "Baingani", "brown": "Brown", "black": "Kaala", "white": "Safed",
+COLOR_NAMES_EN = {
+    "red": "Red", "orange": "Orange", "yellow": "Yellow", "green": "Green",
+    "blue": "Blue", "purple": "Purple", "brown": "Brown", "black": "Black", "white": "White",
 }
 
 # chat_id -> game state dict
@@ -108,13 +114,13 @@ color_games = {}
 
 
 def build_color_pick_keyboard():
-    """Keyboard shown ONLY meant for the giver, to secretly pick a color name."""
-    names = list(COLOR_NAMES_HI.keys())
+    """Keyboard shown only for the giver, to secretly pick a color name."""
+    names = list(COLOR_NAMES_EN.keys())
     random.shuffle(names)
     rows = []
     row = []
     for name in names:
-        row.append(InlineKeyboardButton(COLOR_NAMES_HI[name], callback_data=f"cg_color:{name}"))
+        row.append(InlineKeyboardButton(COLOR_NAMES_EN[name], callback_data=f"cg_color:{name}"))
         if len(row) == 3:
             rows.append(row)
             row = []
@@ -143,21 +149,23 @@ async def colorgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = color_games.get(chat_id)
     if existing and existing["phase"] != "done":
         await update.message.reply_text(
-            "⚠️ Is chat me pehle se ek Color Game chal raha hai.\n"
-            "Rokne ke liye /endcolorgame use karo."
+            "⚠️ A Color-Color game is already running in this chat.\n"
+            "Use /endcolorgame to stop it first."
         )
         return
 
-    color_games[chat_id] = {"phase": "claim", "giver_id": None, "giver_name": None,
-                             "theme": None, "color": None, "attempted": set()}
+    color_games[chat_id] = {
+        "phase": "claim", "giver_id": None, "giver_name": None,
+        "theme": None, "color": None, "attempted": set(),
+    }
 
     kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🙋 Main color dunga!", callback_data="cg_claim")]]
+        [[InlineKeyboardButton("🙋 I'll pick a color!", callback_data="cg_claim")]]
     )
     await update.message.reply_text(
-        "🎨 *Color-Color Game shuru!*\n\n"
-        "Ek player secret color chunega, baaki sab uska emoji guess karenge.\n"
-        "Kaun apna color dega?",
+        "🎨 *Color-Color game started!*\n\n"
+        "One player will pick a secret color, and everyone else has to guess its emoji.\n"
+        "Who wants to go first?",
         reply_markup=kb,
         parse_mode="Markdown",
     )
@@ -167,9 +175,9 @@ async def endcolorgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in color_games:
         del color_games[chat_id]
-        await update.message.reply_text("🛑 Color Game rok diya gaya.")
+        await update.message.reply_text("🛑 Color-Color game stopped.")
     else:
-        await update.message.reply_text("Is chat me koi Color Game chal hi nahi raha.")
+        await update.message.reply_text("There's no Color-Color game running in this chat.")
 
 
 async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,7 +187,7 @@ async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = color_games.get(chat_id)
 
     if not game:
-        await query.answer("Ye game ab active nahi hai. /colorgame se naya shuru karo.", show_alert=True)
+        await query.answer("This game isn't active anymore. Start a new one with /colorgame.", show_alert=True)
         return
 
     data = query.data
@@ -187,16 +195,16 @@ async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Step 1: someone claims the "giver" role ---
     if data == "cg_claim":
         if game["phase"] != "claim":
-            await query.answer("Kisi ne pehle hi ye role le liya hai!", show_alert=True)
+            await query.answer("Someone already claimed that role!", show_alert=True)
             return
         game["giver_id"] = user.id
         game["giver_name"] = user.first_name
         game["theme"] = random.choice(COLOR_THEMES)
         game["phase"] = "picking"
-        await query.answer("Ab neeche diye buttons me se apna secret color chuno (sirf tum chun sakte ho) 🤫", show_alert=True)
+        await query.answer("Pick your secret color from the buttons below (only you can see/use them) 🤫", show_alert=True)
         await query.edit_message_text(
-            f"🎨 *{user.first_name}* apna secret color soch raha/rahi hai... 🤔\n"
-            f"(Sirf {user.first_name} ye buttons use kar sakte hain)",
+            f"🎨 *{user.first_name}* is thinking of a secret color... 🤔\n"
+            f"(Only {user.first_name} can use these buttons)",
             reply_markup=build_color_pick_keyboard(),
             parse_mode="Markdown",
         )
@@ -205,18 +213,18 @@ async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Step 2: giver secretly picks a color ---
     if data.startswith("cg_color:"):
         if game["phase"] != "picking":
-            await query.answer("Ye step khatam ho chuka hai.", show_alert=True)
+            await query.answer("This step is already over.", show_alert=True)
             return
         if user.id != game["giver_id"]:
-            await query.answer("⛔ Ye tumhari baari nahi hai, sirf color-giver chun sakta hai!", show_alert=True)
+            await query.answer("⛔ It's not your turn - only the color-giver can pick!", show_alert=True)
             return
         color_name = data.split(":", 1)[1]
         game["color"] = color_name
         game["phase"] = "guessing"
-        await query.answer(f"Tumne '{COLOR_NAMES_HI[color_name]}' chun liya ✅ (secret rahega)", show_alert=True)
+        await query.answer(f"You picked '{COLOR_NAMES_EN[color_name]}' ✅ (kept secret)", show_alert=True)
         await query.edit_message_text(
-            f"🎨 *{game['giver_name']}* ne apna secret color chun liya hai!\n\n"
-            f"👇 Baaki sab, sahi emoji guess karo (color-giver guess nahi kar sakta):",
+            f"🎨 *{game['giver_name']}* has picked a secret color!\n\n"
+            f"👇 Everyone else, guess the right emoji (the color-giver can't guess):",
             reply_markup=build_guess_keyboard(game["theme"]),
             parse_mode="Markdown",
         )
@@ -225,78 +233,103 @@ async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Step 3: others try to guess ---
     if data.startswith("cg_guess:"):
         if game["phase"] != "guessing":
-            await query.answer("Ye round khatam ho chuka hai.", show_alert=True)
+            await query.answer("This round is already over.", show_alert=True)
             return
         if user.id == game["giver_id"]:
-            await query.answer("😅 Tum khud apna color guess nahi kar sakte!", show_alert=True)
+            await query.answer("😅 You can't guess your own color!", show_alert=True)
             return
         if user.id in game["attempted"]:
-            await query.answer("⛔ Tumhari chance is round me khatam ho chuki hai!", show_alert=True)
+            await query.answer("⛔ You've already used your guess for this round!", show_alert=True)
             return
 
-        # Chance use ho gayi, chahe sahi ho ya galat - dobara try nahi kar sakte
+        # Using up the guess now, whether it turns out right or wrong.
         game["attempted"].add(user.id)
 
         guess_name = data.split(":", 1)[1]
         if guess_name == game["color"]:
             emoji = game["theme"][game["color"]]
             new_score = update_score(chat_id, user.id, user.first_name, 2)
-            await query.answer("🎉 Sahi jawab! (+2 points)", show_alert=False)
+            await query.answer("🎉 Correct answer! (+2 points)", show_alert=False)
             await query.edit_message_text(
-                f"🎉 *{user.first_name}* ne sahi guess kiya! (+2 points, total: {new_score})\n\n"
-                f"Secret color tha: *{COLOR_NAMES_HI[game['color']]}* {emoji}\n\n"
-                f"Naya round ke liye /colorgame bhejo.",
+                f"🎉 *{user.first_name}* guessed it right! (+2 points, total: {new_score})\n\n"
+                f"The secret color was: *{COLOR_NAMES_EN[game['color']]}* {emoji}\n\n"
+                f"Send /colorgame to start a new round.",
                 parse_mode="Markdown",
             )
             game["phase"] = "done"
             color_games.pop(chat_id, None)
         else:
             new_score = update_score(chat_id, user.id, user.first_name, -1)
-            await query.answer("❌ Galat! Is round me tumhari chance khatam.", show_alert=True)
+            await query.answer("❌ Wrong! You've used your guess for this round.", show_alert=True)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"❌ *{user.first_name}* ne galat guess kiya! (-1 point, total: {new_score})\n"
-                    f"Ab inki chance is round me khatam hai — baaki log try kar sakte hain."
+                    f"❌ *{user.first_name}* guessed wrong! (-1 point, total: {new_score})\n"
+                    f"They're out for this round - others can still try."
                 ),
                 parse_mode="Markdown",
             )
         return
 
 
+async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    bucket = get_chat_bucket(data, update.effective_chat.id)
+    scores = bucket.get("scores", {})
+    if not scores:
+        await update.message.reply_text("No Color-Color scores yet in this chat.")
+        return
+    ranked = sorted(scores.values(), key=lambda e: e["score"], reverse=True)
+    lines = [f"{i + 1}. {e['name']} — {e['score']} pts" for i, e in enumerate(ranked)]
+    await update.message.reply_text("🏆 *Color-Color Scoreboard*\n\n" + "\n".join(lines), parse_mode="Markdown")
+
+
 # ---------------------------------------------------------------------------
 # Truth & Dare game (user-submitted content)
 # ---------------------------------------------------------------------------
 
+# Two in-memory stages for a /td challenge, keyed by (chat_id, message_id):
+#   td_pending    -> waiting for the target to press Truth/Dare
+#   td_challenges -> waiting for the target to reply with their answer
+td_pending = {}
+td_challenges = {}
+
+
 async def addtruth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text("Use like this:\n`/addtruth Tumhara sabse embarrassing moment kya tha?`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Use it like this:\n`/addtruth What's your most embarrassing moment?`",
+            parse_mode="Markdown",
+        )
         return
     data = load_data()
     bucket = get_chat_bucket(data, update.effective_chat.id)
     bucket["truths"].append(text)
     save_data(data)
-    await update.message.reply_text(f"✅ Truth add ho gaya! (Total: {len(bucket['truths'])})")
+    await update.message.reply_text(f"✅ Truth added! (Total: {len(bucket['truths'])})")
 
 
 async def adddare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text("Use like this:\n`/adddare 1 minute tak bina ruke dance karo`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Use it like this:\n`/adddare Dance non-stop for 1 minute`",
+            parse_mode="Markdown",
+        )
         return
     data = load_data()
     bucket = get_chat_bucket(data, update.effective_chat.id)
     bucket["dares"].append(text)
     save_data(data)
-    await update.message.reply_text(f"✅ Dare add ho gaya! (Total: {len(bucket['dares'])})")
+    await update.message.reply_text(f"✅ Dare added! (Total: {len(bucket['dares'])})")
 
 
 async def truth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     bucket = get_chat_bucket(data, update.effective_chat.id)
     if not bucket["truths"]:
-        await update.message.reply_text("Abhi koi truth add nahi hua. Pehle /addtruth <sawaal> use karo.")
+        await update.message.reply_text("No truths added yet. Use /addtruth <question> first.")
         return
     pick = random.choice(bucket["truths"])
     await update.message.reply_text(f"🧐 *Truth* for {update.effective_user.first_name}:\n{pick}", parse_mode="Markdown")
@@ -306,61 +339,134 @@ async def dare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     bucket = get_chat_bucket(data, update.effective_chat.id)
     if not bucket["dares"]:
-        await update.message.reply_text("Abhi koi dare add nahi hua. Pehle /adddare <kaam> use karo.")
+        await update.message.reply_text("No dares added yet. Use /adddare <task> first.")
         return
     pick = random.choice(bucket["dares"])
     await update.message.reply_text(f"🔥 *Dare* for {update.effective_user.first_name}:\n{pick}", parse_mode="Markdown")
 
 
 async def td_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_name = update.effective_user.first_name
-    if context.args:
-        target_name = " ".join(context.args)
+    """
+    Challenge someone to Truth or Dare.
+    Usage: reply to the target person's message with /td
+    This makes it explicit WHO is being challenged, lets the bot properly tag
+    them, and ensures only they can pick Truth/Dare and answer it.
+    """
+    replied = update.message.reply_to_message
+    if not replied or not replied.from_user or replied.from_user.is_bot:
+        await update.message.reply_text(
+            "To challenge someone, reply to one of their messages with /td.\n"
+            "Example: reply to their message, then send /td"
+        )
+        return
+
+    target = replied.from_user
+    if target.id == update.effective_user.id:
+        await update.message.reply_text("You can't challenge yourself! Reply to someone else's message.")
+        return
+
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🧐 Truth", callback_data=f"td_pick:truth:{target_name}"),
-                InlineKeyboardButton("🔥 Dare", callback_data=f"td_pick:dare:{target_name}"),
+                InlineKeyboardButton("🧐 Truth", callback_data="td_pick:truth"),
+                InlineKeyboardButton("🔥 Dare", callback_data="td_pick:dare"),
             ]
         ]
     )
-    await update.message.reply_text(f"🎲 {target_name}, Truth ya Dare?", reply_markup=kb)
+    target_mention = mention_html(target.id, target.first_name)
+    sent = await update.message.reply_text(
+        f"🎲 {target_mention}, Truth or Dare?\n(Only you can choose - tap a button below)",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    td_pending[(update.effective_chat.id, sent.message_id)] = {
+        "target_id": target.id,
+        "target_name": target.first_name,
+    }
 
 
 async def td_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    _, kind, target_name = query.data.split(":", 2)
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+    pending = td_pending.get((chat_id, message_id))
+
+    if not pending:
+        await query.answer("This challenge isn't active anymore.", show_alert=True)
+        return
+    if query.from_user.id != pending["target_id"]:
+        await query.answer("This challenge isn't for you!", show_alert=True)
+        return
+
+    kind = query.data.split(":", 1)[1]
     data = load_data()
-    bucket = get_chat_bucket(data, query.message.chat_id)
+    bucket = get_chat_bucket(data, chat_id)
     pool = bucket["truths"] if kind == "truth" else bucket["dares"]
+
+    await query.answer()
+
     if not pool:
         cmd = "/addtruth" if kind == "truth" else "/adddare"
-        await query.edit_message_text(f"Abhi koi {kind} add nahi hua. Pehle {cmd} <text> use karo.")
+        await query.edit_message_text(f"No {kind}s have been added yet. Add one first with {cmd} <text>.")
+        td_pending.pop((chat_id, message_id), None)
         return
+
     pick = random.choice(pool)
     emoji = "🧐" if kind == "truth" else "🔥"
-    await query.edit_message_text(f"{emoji} *{kind.title()}* for {target_name}:\n{pick}", parse_mode="Markdown")
+    target_mention = mention_html(pending["target_id"], pending["target_name"])
+
+    await query.edit_message_text(
+        f"{emoji} {kind.title()} for {target_mention}:\n{escape(pick)}\n\n"
+        f"👉 {escape(pending['target_name'])}, reply to THIS message with your answer!",
+        parse_mode="HTML",
+    )
+
+    td_challenges[(chat_id, message_id)] = {
+        "target_id": pending["target_id"],
+        "target_name": pending["target_name"],
+        "kind": kind,
+        "text": pick,
+    }
+    td_pending.pop((chat_id, message_id), None)
+
+
+async def td_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Catches replies to an active Truth/Dare challenge message and posts a
+    clean, formatted answer mentioning the target and quoting what they were given.
+    Ignored if it's not a reply to an active challenge, or the replier isn't the target.
+    """
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+
+    chat_id = update.effective_chat.id
+    parent_id = msg.reply_to_message.message_id
+    challenge = td_challenges.get((chat_id, parent_id))
+    if not challenge:
+        return
+    if msg.from_user.id != challenge["target_id"]:
+        return  # only the target's answer counts
+
+    answer_text = msg.text or msg.caption or "[non-text answer]"
+    emoji = "🧐" if challenge["kind"] == "truth" else "🔥"
+    target_mention = mention_html(challenge["target_id"], challenge["target_name"])
+
+    await msg.reply_text(
+        f"{emoji} {target_mention} answered the {challenge['kind']}:\n"
+        f"“{escape(challenge['text'])}”\n\n"
+        f"💬 {escape(answer_text)}",
+        parse_mode="HTML",
+    )
+    td_challenges.pop((chat_id, parent_id), None)
 
 
 async def tdcount_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     bucket = get_chat_bucket(data, update.effective_chat.id)
     await update.message.reply_text(
-        f"📊 Is chat me:\nTruths: {len(bucket['truths'])}\nDares: {len(bucket['dares'])}"
+        f"📊 In this chat:\nTruths: {len(bucket['truths'])}\nDares: {len(bucket['dares'])}"
     )
-
-
-async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    bucket = get_chat_bucket(data, update.effective_chat.id)
-    scores = bucket.get("scores", {})
-    if not scores:
-        await update.message.reply_text("Abhi tak Color-Color me koi score nahi bana hai.")
-        return
-    ranked = sorted(scores.values(), key=lambda e: e["score"], reverse=True)
-    lines = [f"{i+1}. {e['name']} — {e['score']} pts" for i, e in enumerate(ranked)]
-    await update.message.reply_text("🏆 *Color-Color Scoreboard*\n\n" + "\n".join(lines), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -369,19 +475,19 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Namaste! Main 2 games khila sakta hoon:\n\n"
+        "👋 Hey! I can run 2 games:\n\n"
         "🎨 *Color-Color*\n"
-        "/colorgame - naya round shuru karo\n"
-        "/endcolorgame - round rok do\n"
-        "/score - is chat ka scoreboard dekho\n\n"
-        "🎲 *Truth & Dare* (khud ke sawaal/dare add karo)\n"
-        "/addtruth <sawaal>\n"
-        "/adddare <kaam>\n"
-        "/truth - random truth\n"
-        "/dare - random dare\n"
-        "/td [naam] - Truth ya Dare button\n"
-        "/tdcount - kitne truths/dares saved hain\n\n"
-        "Dono games group aur private, dono me chalte hain!",
+        "/colorgame - start a new round\n"
+        "/endcolorgame - stop the round\n"
+        "/score - see this chat's scoreboard\n\n"
+        "🎲 *Truth & Dare* (add your own questions/dares)\n"
+        "/addtruth <question>\n"
+        "/adddare <task>\n"
+        "/truth - random truth for you\n"
+        "/dare - random dare for you\n"
+        "/td - reply to someone's message with this to challenge them\n"
+        "/tdcount - how many truths/dares are saved\n\n"
+        "Both games work in groups and in private chats!",
         parse_mode="Markdown",
     )
 
@@ -399,9 +505,9 @@ def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise SystemExit(
-            "❌ BOT_TOKEN environment variable set nahi hai.\n"
-            "Railway par: Project -> Variables -> BOT_TOKEN add karo.\n"
-            "Local par: export BOT_TOKEN='your-token-from-botfather'"
+            "❌ BOT_TOKEN environment variable is not set.\n"
+            "On Railway: Project -> Variables -> add BOT_TOKEN.\n"
+            "Locally: export BOT_TOKEN='your-token-from-botfather'"
         )
 
     app = ApplicationBuilder().token(token).build()
@@ -422,10 +528,12 @@ def main():
     app.add_handler(CommandHandler("td", td_cmd))
     app.add_handler(CommandHandler("tdcount", tdcount_cmd))
     app.add_handler(CallbackQueryHandler(td_callback, pattern="^td_pick:"))
+    # Catches the target's reply to an active Truth/Dare challenge message.
+    app.add_handler(MessageHandler(filters.REPLY & ~filters.COMMAND, td_reply_handler))
 
     logger.info("Bot starting (polling)...")
     # drop_pending_updates avoids replaying a pile of stale updates after a
-    # Railway redeploy/restart, and close_loop=False keeps shutdown clean.
+    # Railway redeploy/restart.
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
